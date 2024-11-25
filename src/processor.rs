@@ -6,89 +6,113 @@ use thiserror::Error;
 use crate::model::{Account, AccountSummary, ClientId, Transaction, TransactionId};
 
 #[derive(Debug, Error)]
-pub enum ProcessingError {
-    #[error("Cannot execute transactions with negative amount. client={client} tx={tx}")]
-    NegativeAmount { client: ClientId, tx: TransactionId },
-    #[error("Cannot execute transactions on a locked account. client={client} tx={tx}")]
-    LockedAccount { client: ClientId, tx: TransactionId },
-    #[error("Not sufficient funds for withdrawal client={client} tx={tx}")]
-    NotSufficientFundsForWithdrawal { client: ClientId, tx: TransactionId },
-    #[error("Dispute references transaction that already disputed. client={client} tx={tx}")]
-    DisputeReferencesAlreadyDisputedTx { client: ClientId, tx: TransactionId },
-    #[error("Dispute transaction cannot be handled. client={client} tx={tx}")]
-    NotSufficientFundsForDispute { client: ClientId, tx: TransactionId },
-    #[error("Cannot resolve transaction not under dispute. client={client} tx={tx}")]
-    CannotResolveWhenTxNotUnderDispute { client: ClientId, tx: TransactionId },
-    #[error("Cannot chargeback transaction not under dispute. client={client} tx={tx}")]
-    ChargebackWhenNotUnderDispute { client: ClientId, tx: TransactionId },
+#[cfg_attr(test, derive(PartialEq))]
+pub enum ProcessingErrorKind {
+    #[error("Cannot execute transactions with negative amount")]
+    NegativeAmount,
+    #[error("Not sufficient funds for executing transaction")]
+    NotSufficientFunds,
+    #[error("Dispute references transaction that already disputed")]
+    DisputeReferencesAlreadyDisputedTx,
+    #[error("Dispute transaction cannot be handled")]
+    NotSufficientFundsForDispute,
+    #[error("Cannot resolve transaction when not under dispute")]
+    ResolveWhenTxNotUnderDispute,
+    #[error("Cannot chargeback transaction when not under dispute")]
+    ChargebackWhenTxNotUnderDispute,
+}
+
+#[derive(Debug, Error)]
+#[error("client={client} tx={tx}. Error: {kind}")]
+pub struct ProcessingError {
+    client: ClientId,
+    tx: TransactionId,
+    kind: ProcessingErrorKind,
 }
 
 #[derive(Default)]
 pub struct TransactionProcessor {
     accounts: HashMap<ClientId, Account>,
-    transactions: HashMap<TransactionId, State>,
+    transactions: HashMap<TransactionId, TransactionState>,
 }
 
-struct State {
+#[derive(Debug)]
+struct TransactionState {
     amount: Decimal,
     is_under_dispute: bool,
     is_deposit: bool,
 }
 
 impl TransactionProcessor {
-    pub fn handle(&mut self, tx: Transaction) -> Result<(), ProcessingError> {
+    pub fn handle(&mut self, tx: Transaction) {
         let account = self.accounts.entry(tx.client_id()).or_default();
 
-        if account.locked {
-            return Ok(());
+        // we skip processing an account that has been locked or if a transaction resulted in an error
+        if account.locked || account.error.is_some() {
+            return;
         }
 
         match &tx {
             Transaction::Deposit(deposit) => {
                 if deposit.amount < Decimal::ZERO {
-                    return Err(ProcessingError::NegativeAmount {
+                    account.error = Some(ProcessingError {
                         client: deposit.client,
                         tx: deposit.transaction_id,
+                        kind: ProcessingErrorKind::NegativeAmount,
                     });
+
+                    return;
                 }
 
                 account.available += deposit.amount;
             }
             Transaction::Withdrawal(withdrawal) => {
                 if withdrawal.amount < Decimal::ZERO {
-                    return Err(ProcessingError::NegativeAmount {
+                    account.error = Some(ProcessingError {
                         client: withdrawal.client,
                         tx: withdrawal.transaction_id,
+                        kind: ProcessingErrorKind::NegativeAmount,
                     });
+
+                    return;
                 }
 
                 if withdrawal.amount > account.available {
-                    return Err(ProcessingError::NotSufficientFundsForWithdrawal {
+                    account.error = Some(ProcessingError {
                         client: withdrawal.client,
                         tx: withdrawal.transaction_id,
+                        kind: ProcessingErrorKind::NotSufficientFunds,
                     });
+
+                    return;
                 }
 
                 account.available -= withdrawal.amount;
             }
             Transaction::Dispute(dispute) => {
                 let Some(tx_state) = self.transactions.get_mut(&dispute.transaction_id) else {
-                    return Ok(());
+                    return;
                 };
 
                 if tx_state.is_under_dispute {
-                    return Err(ProcessingError::DisputeReferencesAlreadyDisputedTx {
+                    account.error = Some(ProcessingError {
                         client: dispute.client,
                         tx: dispute.transaction_id,
+                        kind: ProcessingErrorKind::DisputeReferencesAlreadyDisputedTx,
                     });
+
+                    return;
                 }
 
                 if tx_state.is_deposit {
                     if tx_state.amount > account.available {
-                        return Err(ProcessingError::NotSufficientFundsForDispute {
+                        account.error = Some(ProcessingError {
                             client: dispute.client,
                             tx: dispute.transaction_id,
+                            kind: ProcessingErrorKind::NotSufficientFundsForDispute,
                         });
+
+                        return;
                     }
 
                     account.available -= tx_state.amount;
@@ -101,14 +125,17 @@ impl TransactionProcessor {
             }
             Transaction::Resolve(resolve) => {
                 let Some(tx_state) = self.transactions.get_mut(&resolve.transaction_id) else {
-                    return Ok(());
+                    return;
                 };
 
                 if !tx_state.is_under_dispute {
-                    return Err(ProcessingError::CannotResolveWhenTxNotUnderDispute {
+                    account.error = Some(ProcessingError {
                         client: resolve.client,
                         tx: resolve.transaction_id,
+                        kind: ProcessingErrorKind::ResolveWhenTxNotUnderDispute,
                     });
+
+                    return;
                 }
 
                 account.available += tx_state.amount;
@@ -118,14 +145,17 @@ impl TransactionProcessor {
             }
             Transaction::Chargeback(chargeback) => {
                 let Some(tx_state) = self.transactions.get_mut(&chargeback.transaction_id) else {
-                    return Ok(());
+                    return;
                 };
 
                 if !tx_state.is_under_dispute {
-                    return Err(ProcessingError::ChargebackWhenNotUnderDispute {
+                    account.error = Some(ProcessingError {
                         client: chargeback.client,
                         tx: chargeback.transaction_id,
+                        kind: ProcessingErrorKind::ChargebackWhenTxNotUnderDispute,
                     });
+
+                    return;
                 }
 
                 if tx_state.is_deposit {
@@ -141,35 +171,36 @@ impl TransactionProcessor {
         }
 
         self.add_transaction(tx);
-
-        Ok(())
     }
 
     pub fn summary(self) -> impl Iterator<Item = AccountSummary> {
-        self.accounts.into_iter().map(|(client, account)| {
-            let available = account.available;
-            let held = account.held;
+        self.accounts
+            .into_iter()
+            .filter(|(_, client)| client.error.is_none())
+            .map(|(client, account)| {
+                let available = account.available;
+                let held = account.held;
 
-            AccountSummary {
-                client,
-                available,
-                held,
-                total: available + held,
-                locked: account.locked,
-            }
-        })
+                AccountSummary {
+                    client,
+                    available,
+                    held,
+                    total: available + held,
+                    locked: account.locked,
+                }
+            })
     }
 
     fn add_transaction(&mut self, tx: Transaction) {
         let tx_id = tx.tx_id();
 
         let state = match tx {
-            Transaction::Deposit(deposit) => State {
+            Transaction::Deposit(deposit) => TransactionState {
                 amount: deposit.amount,
                 is_under_dispute: false,
                 is_deposit: true,
             },
-            Transaction::Withdrawal(withdrawal) => State {
+            Transaction::Withdrawal(withdrawal) => TransactionState {
                 amount: withdrawal.amount,
                 is_under_dispute: false,
                 is_deposit: false,
@@ -197,6 +228,29 @@ mod test {
     use super::*;
 
     #[test]
+    fn test_trying_to_revert_withdrawn_funds_locks_account() {
+        let mut processor = TransactionProcessor::default();
+
+        for tx in [
+            deposit(1.into(), 1.into(), Decimal::new(15, 1)),
+            deposit(1.into(), 2.into(), Decimal::new(15, 1)),
+            withdraw(1.into(), 3.into(), Decimal::new(15, 1)),
+            dispute(1.into(), 1.into()),
+            chargeback(1.into(), 1.into()),
+        ] {
+            processor.handle(tx)
+        }
+
+        dbg!(&processor.accounts[&ClientId::from(1)]);
+
+        let summary = processor.summary().next().unwrap();
+
+        assert_eq!(summary.client, 1.into());
+        assert!(summary.locked);
+        assert_eq!(summary.total, Decimal::ZERO);
+    }
+
+    #[test]
     fn test_chargeback_locks_account() {
         let mut processor = TransactionProcessor::default();
 
@@ -205,13 +259,15 @@ mod test {
             dispute(1.into(), 2.into()),
             chargeback(1.into(), 2.into()),
         ] {
-            processor.handle(tx).unwrap()
+            processor.handle(tx)
         }
+
+        assert!(processor.accounts[&ClientId::from(1)].error.is_none());
 
         let summary = processor.summary().next().unwrap();
 
         assert_eq!(summary.client, 1.into());
-        assert_eq!(summary.locked, true);
+        assert!(summary.locked);
         assert_eq!(summary.total, Decimal::ZERO);
     }
 
@@ -224,13 +280,15 @@ mod test {
             withdraw(1.into(), 3.into(), Decimal::new(50, 1)),
             dispute(1.into(), 3.into()),
         ] {
-            processor.handle(tx).unwrap()
+            processor.handle(tx);
         }
+
+        assert!(processor.accounts[&ClientId::from(1)].error.is_none());
 
         let summary = processor.summary().next().unwrap();
 
         assert_eq!(summary.client, 1.into());
-        assert_eq!(summary.locked, false);
+        assert!(!summary.locked);
         assert_eq!(summary.available, Decimal::new(105, 1));
         assert_eq!(summary.held, Decimal::new(50, 1));
     }
@@ -239,12 +297,13 @@ mod test {
     fn test_resolve_fails_if_transaction_not_under_dispute() {
         let mut processor = TransactionProcessor::default();
 
-        processor
-            .handle(deposit(1.into(), 2.into(), Decimal::new(15, 1)))
-            .unwrap();
-        let res = processor.handle(resolve(1.into(), 2.into()));
+        processor.handle(deposit(1.into(), 2.into(), Decimal::new(15, 1)));
+        processor.handle(resolve(1.into(), 2.into()));
 
-        assert2::let_assert!(Err(ProcessingError::CannotResolveWhenTxNotUnderDispute { .. }) = res);
+        check_error_kind(
+            &processor.accounts[&ClientId::from(1)],
+            ProcessingErrorKind::ResolveWhenTxNotUnderDispute,
+        );
     }
 
     #[test]
@@ -255,11 +314,14 @@ mod test {
             deposit(1.into(), 2.into(), Decimal::new(15, 1)),
             withdraw(1.into(), 3.into(), Decimal::new(5, 1)),
         ] {
-            processor.handle(tx).unwrap()
+            processor.handle(tx);
         }
-        let res = processor.handle(dispute(1.into(), 2.into()));
+        processor.handle(dispute(1.into(), 2.into()));
 
-        assert2::let_assert!(Err(ProcessingError::NotSufficientFundsForDispute { .. }) = res);
+        check_error_kind(
+            &processor.accounts[&ClientId::from(1)],
+            ProcessingErrorKind::NotSufficientFundsForDispute,
+        );
     }
 
     #[test]
@@ -270,8 +332,12 @@ mod test {
             deposit(1.into(), 2.into(), Decimal::new(-10, 1)),
             withdraw(1.into(), 3.into(), Decimal::new(-5, 1)),
         ] {
-            let res = processor.handle(tx);
-            assert2::let_assert!(Err(ProcessingError::NegativeAmount { .. }) = res);
+            processor.handle(tx);
+
+            check_error_kind(
+                &processor.accounts[&ClientId::from(1)],
+                ProcessingErrorKind::NegativeAmount,
+            );
         }
     }
 
@@ -280,9 +346,12 @@ mod test {
         let mut processor = TransactionProcessor::default();
         let tx = withdraw(1.into(), 2.into(), Decimal::new(20, 1));
 
-        let res = processor.handle(tx);
+        processor.handle(tx);
 
-        assert2::let_assert!(Err(ProcessingError::NotSufficientFundsForWithdrawal { .. }) = res);
+        check_error_kind(
+            &processor.accounts[&ClientId::from(1)],
+            ProcessingErrorKind::NotSufficientFunds,
+        );
     }
 
     #[test]
@@ -292,12 +361,15 @@ mod test {
             deposit(1.into(), 2.into(), Decimal::new(20, 1)),
             dispute(1.into(), 2.into()),
         ] {
-            processor.handle(tx).unwrap();
+            processor.handle(tx);
         }
 
-        let res = processor.handle(dispute(1.into(), 2.into()));
+        processor.handle(dispute(1.into(), 2.into()));
 
-        assert2::let_assert!(Err(ProcessingError::DisputeReferencesAlreadyDisputedTx { .. }) = res);
+        check_error_kind(
+            &processor.accounts[&ClientId::from(1)],
+            ProcessingErrorKind::DisputeReferencesAlreadyDisputedTx,
+        );
     }
 
     fn deposit(client: ClientId, tx: TransactionId, amt: Decimal) -> Transaction {
@@ -335,5 +407,12 @@ mod test {
             client,
             transaction_id: tx,
         })
+    }
+
+    #[track_caller]
+    fn check_error_kind(account: &Account, expected_error_kind: ProcessingErrorKind) {
+        let error = account.error.as_ref().map(|e| &e.kind);
+
+        assert_eq!(Some(&expected_error_kind), error);
     }
 }

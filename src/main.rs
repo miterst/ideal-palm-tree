@@ -18,12 +18,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut handler = TransactionProcessor::default();
 
-    for (line, record) in reader.deserialize().enumerate() {
+    for record in reader.deserialize() {
         let transaction: Transaction = record.context("Failed parsing file")?;
 
-        handler
-            .handle(transaction)
-            .with_context(|| format!("Failed handling transaction on    : {}", line + 2))?;
+        handler.handle(transaction);
     }
 
     let stdout = io::stdout().lock();

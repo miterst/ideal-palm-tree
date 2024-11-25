@@ -83,7 +83,7 @@ client,available,held,total,locked
 ### Assumptions
 
 - Each client has a single asset account.
-- Stops the processing when encountering an error.
+- Continues processing when encountering an error(skipping accounts for which there was an error).
 - Transaction IDs (tx) are unique but may appear in any order.
 - Transactions are processed in the order they appear in the file.
 - Invalid transactions (e.g., referencing non-existent transactions) are ignored.
